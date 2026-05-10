@@ -391,12 +391,18 @@ try:
     # §6  Rename helpers
     # ─────────────────────────────────────────────────────────────────
 
-    def rename_if_unnamed(func, new_name):
+    def rename_if_unnamed(func, new_name, force=False):
         if func is None:
             return False
         old = func.getName()
-        if not old.startswith('FUN_') and not old.startswith('thunk_FUN_'):
+        if not force and not old.startswith('FUN_') and not old.startswith('thunk_FUN_'):
             return False
+        if old == new_name:
+            return False
+        # Also force-rename if old name contains 'unknown'
+        if not force and 'unknown' not in old:
+            if not old.startswith('FUN_') and not old.startswith('thunk_FUN_'):
+                return False
         try:
             func.setName(new_name, SourceType.USER_DEFINED)
             return True
@@ -565,6 +571,34 @@ try:
                 print("  FUN_%08x -> %s" % (
                     mgr.getEntryPoint().getOffset(), name))
     print("  Renamed %d function(s)." % renamed)
+    
+    # Set correct prototypes on all manager functions
+    # Manager signature: void manager(void* src_buf, void* dst_buf, int op)
+    print("  Setting manager prototypes...")
+    mgr_proto_set = 0
+    for entry in all_entries:
+        for mgr in entry['managers']:
+            try:
+                from ghidra.app.cmd.function import ApplyFunctionSignatureCmd
+                from ghidra.program.model.data import (
+                    FunctionDefinitionDataType, ParameterDefinitionImpl
+                )
+                # Build prototype: void manager(void* src, void* dst, int op)
+                fdt = FunctionDefinitionDataType(mgr.getName())
+                fdt.setReturnType(VoidDataType.dataType)
+                params = [
+                    ParameterDefinitionImpl("src_buf", Pointer32DataType.dataType, "Source buffer"),
+                    ParameterDefinitionImpl("dst_buf", Pointer32DataType.dataType, "Dest buffer / output"),
+                    ParameterDefinitionImpl("op", UnsignedIntegerDataType.dataType, "functor_manager_operation_type"),
+                ]
+                fdt.setArguments(params)
+                cmd = ApplyFunctionSignatureCmd(
+                    mgr.getEntryPoint(), fdt, SourceType.USER_DEFINED)
+                cmd.applyTo(currentProgram)
+                mgr_proto_set += 1
+            except:
+                pass
+    print("  Set %d manager prototype(s)." % mgr_proto_set)
 
     # ── Step 4: Find vtables ───────────────────────────────────────
     print("\n[4/9] Finding boost::function vtables...")
@@ -914,11 +948,19 @@ try:
                             continue
                         
                         # Look for the vtable pointer variable:
-                        # It's typically a 4-byte local with a default name
-                        # that gets assigned from PTR_PTR_*
-                        # The boost::function struct starts at the vtable var
-                        if (name.startswith('local_') and 
-                            dt.getLength() <= 4):
+                        # It's any stack local that gets assigned from PTR_PTR_*
+                        # Could be default local_XX or already retyped boost_func_*
+                        if not (name.startswith('local_') or 
+                                name.startswith('boost_func_') or
+                                name.startswith('uStack_') or
+                                name.startswith('iStack_')):
+                            continue
+                        # Skip if already correctly typed
+                        if dt.getName() == func_type.getName():
+                            continue
+                        # Accept if it's a 4-byte ptr or already partially typed
+                        if dt.getLength() > func_type.getLength():
+                            continue
                             # Check high variable's defining pcode ops
                             hv = sym.getHighVariable()
                             if hv is None:
@@ -1037,8 +1079,262 @@ try:
         print("       retype the vtable local + adjacent buffer locals as")
         print("       the boost_function_<Name> struct from /boost/function/")
 
-    # ── Step 9: Annotate vtables and assignment sites ──────────────
-    print("\n[9/9] Annotating vtables and assignment sites...")
+    # ── Step 9: Flow overrides, equates, bind buffer & local renaming ─
+    print("\n[9/10] Setting call overrides, equates, bind buffer types, and local names...")
+    from ghidra.program.model.symbol import RefType
+    
+    eqTbl = currentProgram.getEquateTable()
+    
+    # Ensure equates exist for functor_manager_operation_type
+    eq_names = {
+        0: 'clone_functor_tag',
+        1: 'move_functor_tag',
+        2: 'destroy_functor_tag',
+        3: 'check_functor_type_tag',
+        4: 'get_functor_type_tag',
+    }
+    equates = {}
+    for val, name in eq_names.items():
+        eq = eqTbl.getEquate(name)
+        if eq is None:
+            try:
+                eq = eqTbl.createEquate(name, val)
+            except:
+                pass
+        equates[val] = eq
+    
+    overrides_set = 0
+    equates_set = 0
+    bind_bufs_retyped = 0
+    locals_renamed = 0
+    
+    # For each function that has a vtable assignment, scan for:
+    # 1. bctrl instructions → potential manager/invoker indirect calls
+    # 2. li rN, <constant> just before bctrl → equate candidates
+    # 3. Local bind buffer variables adjacent to the boost::function local
+    
+    seen_override_funcs = set()
+    
+    for vt_info in all_vtables:
+        entry = vt_info['entry']
+        vt_addr = vt_info['vtable_addr']
+        mgr = vt_info['manager']
+        inv_fn = vt_info['invoker_fn']
+        inv_entry = vt_info['invoker_entry']
+        
+        ptr_ptrs = scan_for_u32(vt_addr)
+        for pp_addr in ptr_ptrs:
+            refs = refMgr.getReferencesTo(addr(pp_addr))
+            for ref in refs:
+                from_addr = ref.getFromAddress()
+                func = fm.getFunctionContaining(from_addr)
+                if func is None:
+                    continue
+                func_key = func.getEntryPoint().getOffset()
+                if func_key in seen_override_funcs:
+                    continue
+                seen_override_funcs.add(func_key)
+                
+                body = func.getBody()
+                
+                # Scan for bctrl instructions (PPC opcode 0x4e800421)
+                cur = body.getMinAddress()
+                while cur is not None and cur.compareTo(body.getMaxAddress()) <= 0:
+                    instr = listing.getInstructionAt(cur)
+                    if instr is None:
+                        try:
+                            cur = cur.add(4)
+                        except:
+                            break
+                        continue
+                    
+                    mnemonic = instr.getMnemonicString()
+                    
+                    # Look for bctrl (indirect call via CTR register)
+                    if mnemonic == 'bctrl':
+                        bctrl_addr = cur
+                        
+                        # Check if this bctrl is near our vtable reference
+                        # (within ~256 bytes of the vtable load)
+                        dist = abs(bctrl_addr.getOffset() - from_addr.getOffset())
+                        if dist > 512:
+                            try:
+                                cur = cur.add(4)
+                            except:
+                                break
+                            continue
+                        
+                        # Search backwards for a 'li rN, <constant>' that loads
+                        # the functor_manager_operation_type argument (r5 typically)
+                        scan_addr = bctrl_addr
+                        op_value = None
+                        for back in range(20):
+                            try:
+                                scan_addr = scan_addr.add(-4)
+                            except:
+                                break
+                            prev_instr = listing.getInstructionAt(scan_addr)
+                            if prev_instr is None:
+                                continue
+                            prev_mn = prev_instr.getMnemonicString()
+                            if prev_mn == 'li':
+                                # Check if it's loading into r5 (arg3)
+                                # Operand 0 = register, operand 1 = immediate
+                                try:
+                                    reg = prev_instr.getRegister(0)
+                                    if reg is not None and reg.getName() == 'r5':
+                                        imm = prev_instr.getScalar(1)
+                                        if imm is not None:
+                                            op_value = int(imm.getValue())
+                                            
+                                            # Set equate
+                                            if op_value in equates and equates[op_value] is not None:
+                                                try:
+                                                    equates[op_value].addReference(scan_addr, 1)
+                                                    equates_set += 1
+                                                except:
+                                                    pass
+                                            break
+                                except:
+                                    pass
+                        
+                        # Set CALL_OVERRIDE_UNCONDITIONAL reference.
+                        # This is a RefType (not FlowOverride!) that tells
+                        # the decompiler to treat this bctrl as a direct
+                        # call to the target function.
+                        if op_value is not None and op_value in (0, 2):
+                            # This is a manager call (clone=0 or destroy=2)
+                            try:
+                                # Remove ALL existing references from this bctrl
+                                existing_refs = list(refMgr.getReferencesFrom(bctrl_addr))
+                                for old_ref in existing_refs:
+                                    refMgr.delete(old_ref)
+                                
+                                # Add CALL_OVERRIDE_UNCONDITIONAL ref
+                                refMgr.addMemoryReference(
+                                    bctrl_addr,
+                                    mgr.getEntryPoint(),
+                                    RefType.CALL_OVERRIDE_UNCONDITIONAL,
+                                    SourceType.USER_DEFINED, 0)
+                                overrides_set += 1
+                            except Exception as oe:
+                                print("    Override failed at 0x%08x: %s" % (
+                                    bctrl_addr.getOffset(), str(oe)))
+                    
+                    try:
+                        cur = cur.add(instr.getLength())
+                    except:
+                        break
+                
+                # Also scan for bctrl that dispatches through the invoker
+                # These are in the CFuncTask execute path, not directly in
+                # the constructor. We handle invoker overrides separately below.
+                
+                # --- Rename local variables ---
+                # Rename the boost::function local to boost_func_<short_name>
+                try:
+                    for var in func.getAllVariables():
+                        if not var.isStackVariable():
+                            continue
+                        dt = var.getDataType()
+                        if dt is None:
+                            continue
+                        dt_name = dt.getName()
+                        var_name = var.getName()
+                        
+                        # Rename boost::function struct locals
+                        if dt_name.startswith('boost_function_') and var_name.startswith('local_'):
+                            short = dt_name.replace('boost_function_', '')
+                            new_name = 'boost_func_%s' % short
+                            try:
+                                var.setName(new_name, SourceType.USER_DEFINED)
+                                locals_renamed += 1
+                            except:
+                                pass
+                except:
+                    pass
+    
+    # --- Retype bind buffer locals ---
+    # The bind buffer is the args to store_args3/store_args2.
+    # It's typically 3 consecutive locals (for PMF) or 2 (for fptr).
+    # These are at the stack offset just above the boost::function local.
+    # We identify them by finding the store_args call and checking
+    # what stack address r3 points to.
+    for sa_addr_val, usages in store_args_map.items():
+        if not usages:
+            continue
+        primary = usages[0]['entry']
+        bind_type = primary.get('bind_type')
+        if bind_type is None:
+            continue
+        
+        for usage in usages:
+            caller = usage['func']
+            call_addr = usage['call_addr']
+            
+            # The first arg (r3) to store_args is a pointer to the local bind buffer.
+            # In the decompiled code this is typically &local_XX.
+            # Find the variable at that stack location by scanning backward
+            # from the call to find the addi rN,r1,<offset> that sets r3.
+            scan = addr(call_addr)
+            bind_buf_offset = None
+            for back in range(10):
+                try:
+                    scan = scan.add(-4)
+                except:
+                    break
+                prev = listing.getInstructionAt(scan)
+                if prev is None:
+                    continue
+                mn = prev.getMnemonicString()
+                if mn == 'addi':
+                    # Check if destination is r3 and source is r1 (stack)
+                    try:
+                        dst_reg = prev.getRegister(0)
+                        src_reg = prev.getRegister(1)
+                        if (dst_reg and src_reg and 
+                            dst_reg.getName() == 'r3' and src_reg.getName() == 'r1'):
+                            imm = prev.getScalar(2)
+                            if imm is not None:
+                                bind_buf_offset = int(imm.getValue())
+                                break
+                    except:
+                        pass
+            
+            if bind_buf_offset is not None:
+                # Find and retype the variable at this stack offset
+                # The stack offset in Ghidra is negative, addi offset is positive
+                # from the frame. We need to convert.
+                try:
+                    for var in caller.getAllVariables():
+                        if not var.isStackVariable():
+                            continue
+                        vo = var.getStackOffset()
+                        # The addi gives the offset from r1 (stack pointer)
+                        # Ghidra's stack offset for locals is negative.
+                        # The actual mapping depends on frame size.
+                        # Just check if the variable name suggests it's the bind buffer
+                        var_name = var.getName()
+                        dt = var.getDataType()
+                        if dt and dt.getName().startswith('boost_function_'):
+                            # This is the boost::function struct, the bind buffer
+                            # is at a higher stack offset (more negative)
+                            # Look for adjacent untyped locals
+                            bf_offset = var.getStackOffset()
+                            bf_size = dt.getLength()
+                            
+                            # The bind buffer is typically right above (more negative)
+                            # the boost::function struct on the stack
+                            pass
+                except:
+                    pass
+    
+    print("  Call overrides set:    %d" % overrides_set)
+    print("  Equates set:          %d" % equates_set)
+    print("  Locals renamed:       %d" % locals_renamed)
+
+    # ── Step 10: Annotate vtables and assignment sites ──────────────
+    print("\n[10/10] Annotating vtables and assignment sites...")
     ann_vtables = 0
     ann_sites = 0
 
